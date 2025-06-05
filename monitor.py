@@ -101,24 +101,12 @@ def bits2mbits(bits):
     return bits/1024/1024
 
 
-def loaddatafromfile(cfg):
-    dates, loss, rate_s, rate_r = [], [], [], []
+def start_test(filename):
+    with open(filename, "a+") as file:
+        file.write('=== TEST START ===\n')
 
-    print('Loading data from file...')
-    with open(cfg.outdatafile, "r") as file:
-        for line in file.readlines():
-            s = line.split(';')
-            print(s)
-            dates.append(datetime.datetime.fromisoformat(s[0]))
-            loss.append(float(s[1]))
-            rate_s.append(float(s[2]))
-            rate_r.append(float(s[3]))
-
-    return dates, loss, rate_s, rate_r
-
-
-def append_data(cfg: ProgConfig, data: tuple):
-    with open(cfg.outdatafile, "a+") as file:
+def append_data(filename, data: tuple):
+    with open(filename, "a") as file:
         s = ''
         for i in range(len(data) - 1):
             s += str(data[i]) + ';'
@@ -126,50 +114,75 @@ def append_data(cfg: ProgConfig, data: tuple):
         print(f"append: '{s}'")
         file.write(s + '\n')
 
+def end_test(filename):
+    with open(filename, "a") as file:
+        file.write('=== TEST END ===\n')
+
+
+def iperf_test():
+    stdout, stderr, interrupted = iperf_run()
+    data = json.loads(stdout)    
+    closs = bits2mbits(int(data['end']['sum_sent']['bytes']) -
+                       int(data['end']['sum_received']['bytes']))
+    stream = data['end']['streams'][0]
+    crate_s = bits2mbits(int(stream['sender']['bits_per_second']))
+    crate_r = bits2mbits(int(stream['receiver']['bits_per_second']))
+
+    return closs, crate_s, crate_r, interrupted
+
+
 def iperf_loop(cfg):
     errors = 0
-    dates, loss, rate_s, rate_r = [], [], [], []
-    
-    try:
-        while True:
-            need_exit = False
-            interrupted = False
-            error_occured = False
-            stdout, stderr = "", ""
+    start_test(cfg.outdatafile)
 
-            try:
-                stdout, stderr, interrupted = iperf_run()
-                errors = 0
-            except KeyboardInterrupt:
-                need_exit = True
-            except ValueError as e:
-                print(f"[ERROR]: {e}")
-                error_occured = True
-                errors += 1
+    while True:
+        interrupted = False
+        closs, crate_s, crate_r = 0, 0, 0
 
-            if interrupted or need_exit or errors == 10:
-                return dates, loss, rate_s, rate_r
-
+        try:
+            sleep(cfg.timeout)
+            closs, crate_s, crate_r, interrupted = iperf_test()
+            errors = 0
             now = datetime.datetime.now()
             # now = now.strftime('%H:%M:%S')
-            closs, crate_s, crate_r = 0, 0, 0
-            if not error_occured:
-                data = json.loads(stdout)    
-                closs = bits2mbits(int(data['end']['sum_sent']['bytes']) -
-                                   int(data['end']['sum_received']['bytes']))
-                stream = data['end']['streams'][0]
-                crate_s = bits2mbits(int(stream['sender']['bits_per_second']))
-                crate_r = bits2mbits(int(stream['receiver']['bits_per_second']))
+            append_data(cfg.outdatafile, (now, closs, crate_s, crate_r))
+            if interrupted:
+                end_test(cfg.outdatafile)
+                return 
+        except KeyboardInterrupt:
+            end_test(cfg.outdatafile)
+            return
+        except ValueError as e:
+            print(f"[ERROR]: {e}")            
+            errors += 1
+            if errors > 10:
+                print("More then 10 errors occured, abort")
+                end_test(cfg.outdatafile)
+                return
 
-            dates.append(now)
-            loss.append(closs)
-            rate_s.append(crate_s)
-            rate_r.append(crate_r)
-            append_data(cfg, (now, closs, crate_s, crate_r))
 
-            sleep(cfg.timeout)
-    except KeyboardInterrupt:
-        return dates, loss, rate_s, rate_r
+def loaddatafromfile(cfg):
+    tests = []
+    dates, loss, rate_s, rate_r = [], [], [], []
+
+    print('Loading data from file...')
+    with open(cfg.outdatafile, "r") as file:
+        for line in file.readlines():
+            if line == '=== TEST START ===\n':
+                continue
+
+            if line == '=== TEST END ===\n':
+                tests.append((dates, loss, rate_s, rate_r))
+                continue
+
+            s = line.split(';')
+            print(s)
+            dates.append(datetime.datetime.fromisoformat(s[0]))
+            loss.append(float(s[1]))
+            rate_s.append(float(s[2]))
+            rate_r.append(float(s[3]))
+
+    return tests
 
 
 def loadprogconfig():
@@ -178,22 +191,24 @@ def loadprogconfig():
     mavalue = os.getenv('MA_VALUE')
     timeout = os.getenv('RESTART_TIMEOUT')
 
-    print(mavalue)
     return ProgConfig(outdatafile=outdatafile, outgraphimage=outputgraph,
                       mavalue=mavalue, timeout=timeout)
 
 
-def plotimage(outname, dates, loss, rate_s, rate_r):
-    print(dates)
-    print(loss)
-    print(rate_s)
-    print(rate_r)
-
+def plottests(outname, tests):
     print('plotting...')
     plt.figure(figsize=(19.20, 10.80), dpi=100)
-    plt.plot(dates, loss, label='loss', color='red')
-    plt.plot(dates, rate_s, label='send rate', color='blue')
-    plt.plot(dates, rate_r, label='recv rate', color='pink')
+    for test in tests:
+        print('\n=== TEST START ===\n')
+        print(test[0])
+        print(test[1])
+        print(test[2])
+        print(test[3])
+
+        plt.plot(test[0], test[1], label='loss', color='red')
+        plt.plot(test[0], test[2], label='send rate', color='blue')
+        plt.plot(test[0], test[3], label='recv rate', color='pink')
+
     plt.legend(loc="upper left")
     plt.grid()
     plt.savefig(outname)
@@ -202,11 +217,9 @@ def plotimage(outname, dates, loss, rate_s, rate_r):
 def main():
     load_dotenv()
     cfg = loadprogconfig()
-
-    dates, loss, rate_s, rate_r = iperf_loop(cfg)
-    plotimage('prev.png', dates, loss, rate_s, rate_r)
-    dates, loss, rate_s, rate_r = loaddatafromfile(cfg)
-    plotimage(cfg.outgraphimage, dates, loss, rate_s, rate_r)
+    iperf_loop(cfg)
+    tests = loaddatafromfile(cfg)
+    plottests(cfg.outgraphimage, tests)
 
 
 if __name__ == "__main__":
